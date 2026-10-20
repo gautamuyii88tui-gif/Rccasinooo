@@ -261,7 +261,6 @@ async def finish_match(sess: dict, payout_a: int, payout_b: int = 0, cashed_out:
     m: Match = sess["match"]
     ua, ub = sess["ua"], sess["ub"]
 
-    # Status ko ended mark karo taaki race conditions na ho
     sess["status"] = "ended"
 
     matches.pop(gid, None)
@@ -325,7 +324,6 @@ async def evaluate_round(sess: dict):
     sess["round_num"] = sess.get("round_num", 1) + 1
     score_header = f"{game_pe(game)} <b>Score (Round {sess['round_num'] - 1})</b>\n\n• {p1_mention}: <b>{m.score[0]} points</b>\n• {p2_mention}: <b>{m.score[1]} points</b>{f'{pe("🤝")} <b>Tie round — replay!</b>' if w is None else ''}"
 
-    # FIX: Yahan rolling state ko tightly handle kiya gaya hai taaki bot ke turn me user throw na kar sake
     if sess["type"] == "bot" and random.choice([True, False]):
         sess["rolling"] = True
         await edit_msg(chat_id, sess.get("prompt_msg_id", 0), f"{score_header}\n\n{p2_mention} <b>is rolling first...</b>")
