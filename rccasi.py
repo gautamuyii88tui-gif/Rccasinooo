@@ -3,6 +3,7 @@ import html
 import random
 import time
 import aiohttp
+from typing import Dict, List, Optional, Set, Tuple, TypedDict, cast
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery
@@ -26,28 +27,55 @@ try:
 except ImportError:
     HAS_MONGO = False
 
-# --- CONFIG & BOT INITIALIZATION ---
-ACTIVE_BOT_TOKEN = config.BOT_TOKEN.strip()
-ACTIVE_HELPER_TOKEN = getattr(config, "HELPER_BOT_TOKEN", "").strip()
 
-bot = Bot(token=ACTIVE_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-helper_bot = Bot(token=ACTIVE_HELPER_TOKEN) if ACTIVE_HELPER_TOKEN else None
+# --- TYPE DEFINITIONS (Professional Structuring) ---
+class GameSession(TypedDict, total=False):
+    gid: str
+    type: str
+    status: str
+    chat_id: int
+    game: str
+    mode: str
+    target: int
+    stake: int
+    ua: int
+    ub: int
+    match: Match
+    turn_uid: int
+    u_rolls: List[int]
+    b_rolls: List[int]
+    rolling: bool
+    round_num: int
+    created_at: float
+    last_action: float
+    lock: asyncio.Lock
+    prompt_msg_id: Optional[int]
+    gid_b: Optional[str]
+    spam_warned: Optional[bool]
 
-dp = Dispatcher()
-router = Router()
 
-mongo_client = None
+# --- CONFIG & GLOBALS ---
+ACTIVE_BOT_TOKEN: str = config.BOT_TOKEN.strip()
+ACTIVE_HELPER_TOKEN: str = getattr(config, "HELPER_BOT_TOKEN", "").strip()
+
+bot: Bot = Bot(token=ACTIVE_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+helper_bot: Optional[Bot] = Bot(token=ACTIVE_HELPER_TOKEN) if ACTIVE_HELPER_TOKEN else None
+
+dp: Dispatcher = Dispatcher()
+router: Router = Router()
+
+mongo_client: Optional[AsyncIOMotorClient] = None
 db = None
-HTTP_SESSION: aiohttp.ClientSession | None = None
+HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
-matches: dict[str, dict] = {}
-user_match: dict[int, str] = {}
-msg_owner: dict[tuple[int, int], int] = {}
-user_names: dict[int, str] = {}
-busy: set[int] = set()
-user_last_dice_time: dict[int, float] = {}
+matches: Dict[str, GameSession] = {}
+user_match: Dict[int, str] = {}
+msg_owner: Dict[Tuple[int, int], int] = {}
+user_names: Dict[int, str] = {}
+busy: Set[int] = set()
+user_last_dice_time: Dict[int, float] = {}
 
-PREMIUM_EMOJIS = {
+PREMIUM_EMOJIS: Dict[str, str] = {
     "🎮": "5258508428212445001", "🎲": "5960608239623082921",
     "👑": "6021428854889913572", "👎": "5084577224980431440",
     "🤝": "5974565221182741203", "🪙": "4918300654197277832",
@@ -60,15 +88,17 @@ PREMIUM_EMOJIS = {
 
 def pe(emoji_char: str) -> str:
     eid = PREMIUM_EMOJIS.get(emoji_char)
-    if eid: return f'<tg-emoji emoji-id="{eid}">{emoji_char}</tg-emoji>'
-    return emoji_char
+    return f'<tg-emoji emoji-id="{eid}">{emoji_char}</tg-emoji>' if eid else emoji_char
 
 def get_game_emo(game: str) -> str:
     mapping = {"dice": "🎲", "basket": "🏀", "bask": "🏀", "football": "⚽", "bowl": "🎳", "dart": "🎯"}
     return mapping.get(game, "🎲")
 
-def game_pe(game: str) -> str: return pe(get_game_emo(game))
-def usd(cents: int) -> str: return f"${cents / 100:.2f}"
+def game_pe(game: str) -> str: 
+    return pe(get_game_emo(game))
+
+def usd(cents: int) -> str: 
+    return f"${cents / 100:.2f}"
 
 def track_user_info(u):
     uid = u.id
@@ -76,7 +106,7 @@ def track_user_info(u):
     fname = u.first_name or u.username or "Player"
     user_names[uid] = fname
 
-def mention(uid: int, name: str = None) -> str:
+def mention(uid: int, name: Optional[str] = None) -> str:
     label = name or user_names.get(uid) or "Player"
     return f'<a href="tg://user?id={uid}">{html.escape(str(label))}</a>'
 
@@ -139,7 +169,6 @@ async def parse_bet(uid: int, arg_str: str) -> tuple[int, int]:
 async def get_session() -> aiohttp.ClientSession:
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
-        # Aggressive keepalive and DNS cache to eliminate the 0.5s button delay completely
         connector = aiohttp.TCPConnector(limit=1000, keepalive_timeout=600, ttl_dns_cache=600, use_dns_cache=True)
         timeout = aiohttp.ClientTimeout(total=5, connect=2)
         HTTP_SESSION = aiohttp.ClientSession(connector=connector, timeout=timeout)
@@ -201,7 +230,7 @@ async def send_emoji_roll(chat_id: int, game: str, n: int, reply_to: int = None)
     for res in results:
         if isinstance(res, Message) and res.dice: values.append(res.dice.value)
             
-    await asyncio.sleep(1.2) # Visually optimal animation delay
+    await asyncio.sleep(1.2) 
     return values
 
 
@@ -234,8 +263,6 @@ def turn_kb(sess: dict, show_bot_first: bool = False):
     rows = []
     if sess["type"] == "bot":
         cashout = calc_cashout(sess["stake"], m.score[0], m.score[1], sess["target"])
-        
-        # CASHOUT LOGIC: Button only appears if at least 1 round is finished (round_num > 1)
         if cashout > 0 and sess.get("round_num", 1) > 1 and not sess["u_rolls"]: 
             rows.append([(f"Cashout {usd(cashout)}", f"cashout:{gid}", "success", "🪙")])
             
@@ -246,9 +273,8 @@ def turn_kb(sess: dict, show_bot_first: bool = False):
     return kb(*rows)
 
 
-# --- SMART CASHOUT CALCULATOR (Even supports loss recovery) ---
+# --- SMART CASHOUT CALCULATOR ---
 def calc_cashout(stake: int, p_score: int, b_score: int, target: int) -> int:
-    # Do not offer cashout before any round completes
     if p_score == 0 and b_score == 0: 
         return 0 
         
@@ -256,12 +282,12 @@ def calc_cashout(stake: int, p_score: int, b_score: int, target: int) -> int:
     diff = p_score - b_score
     
     if diff == 0:
-        return int(stake * 0.85) # Tie round (1-1) -> Return 85% of stake
+        return int(stake * 0.85)
     elif diff > 0:
         progress = diff / target
         return min(int(stake + (full_win - stake) * (0.45 + 0.35 * progress)), int(full_win * 0.92))
     else:
-        return int(stake * (0.45 ** abs(diff))) # Losing round -> Return partial fraction
+        return int(stake * (0.45 ** abs(diff)))
 
 
 # --- MATCH ENGINE ---
@@ -404,7 +430,6 @@ async def handle_user_sent_dice(m: Message):
     sess = matches[gid]
     if sess["chat_id"] != chat_id or sess.get("status") != "playing" or sess.get("turn_uid") != uid: return
     
-    # SPAM PROTECTION: Strictly 1 English warning, blocks subsequent rapid dice throws instantly
     now = time.time()
     if now - user_last_dice_time.get(uid, 0) < 1.0:
         if not sess.get("spam_warned"):
@@ -480,125 +505,136 @@ async def cmd_games(m: Message):
     await send_msg(chat_id, mode_screen_text(game), markup=mode_screen_kb(game, stake), reply_to=m.message_id, owner_id=uid)
 
 
-# --- 0-LATENCY CALLBACK ROUTER ---
-@router.callback_query()
-async def handle_callback_all(c: CallbackQuery):
-    await c.answer() # SPINNER DIES INSTANTLY
+# --- 0-LATENCY MODULAR CALLBACK ROUTERS ---
+@router.callback_query(F.data == "del")
+async def cb_delete_msg(c: CallbackQuery):
+    await c.answer()
+    try: await c.message.delete()
+    except Exception: pass
 
-    track_user_info(c.from_user)
-    uid = c.from_user.id
-    data = c.data
-    msg = c.message
-    chat_id = msg.chat.id
-    is_private = (msg.chat.type == "private")
-
-    if data == "del":
-        try: await msg.delete()
-        except Exception: pass
+@router.callback_query(F.data.startswith("back_mode:"))
+async def cb_back_mode(c: CallbackQuery):
+    await c.answer()
+    if c.message.chat.type == "private" or msg_owner.get((c.message.chat.id, c.message.message_id)) != c.from_user.id:
         return
+    _, game, stake = c.data.split(":")
+    asyncio.create_task(edit_msg(c.message.chat.id, c.message.message_id, mode_screen_text(game), markup=mode_screen_kb(game, int(stake)), owner_id=c.from_user.id))
 
-    owner = msg_owner.get((chat_id, msg.message_id))
-    if owner and owner != uid: return
+@router.callback_query(F.data.startswith("mode:"))
+async def cb_select_target(c: CallbackQuery):
+    await c.answer()
+    if c.message.chat.type == "private" or msg_owner.get((c.message.chat.id, c.message.message_id)) != c.from_user.id:
+        return
+    _, game, stake, mode = c.data.split(":")
+    asyncio.create_task(edit_msg(c.message.chat.id, c.message.message_id, target_screen_text(game), markup=target_screen_kb(game, int(stake), mode), owner_id=c.from_user.id))
 
-    if data.startswith("back_mode:"):
-        if is_private: return
-        _, game, stake = data.split(":")
-        asyncio.create_task(edit_msg(chat_id, msg.message_id, mode_screen_text(game), markup=mode_screen_kb(game, int(stake)), owner_id=uid))
-        
-    elif data.startswith("mode:"):
-        if is_private: return
-        _, game, stake, mode = data.split(":")
-        asyncio.create_task(edit_msg(chat_id, msg.message_id, target_screen_text(game), markup=target_screen_kb(game, int(stake), mode), owner_id=uid))
-        
-    elif data.startswith("tgt:"):
-        if is_private: return
-        _, game, stake, mode, target = data.split(":")
-        base = f"{game}:{stake}:{mode}:{target}"
-        
-        # Safely fetch game title
-        game_title = getattr(config, "GAME_NAMES", {}).get(game, game.title())
-        
-        txt = f"{game_pe(game)} <b>{game_title} · {usd(int(stake))}</b>\n<b>Player:</b> {mention(uid)}\n<b>Mode: {MODES[mode]['label']} ({target} points)</b>\n\n<b>Choose your opponent:</b>"
-        markup = kb([("Play vs Bot", f"opp:{base}:bot", "success", "🤖"), ("Play PvP", f"opp:{base}:pvp", "primary", "👤")], [("Back", f"mode:{game}:{stake}:{mode}", "danger", "❌")])
-        asyncio.create_task(edit_msg(chat_id, msg.message_id, txt, markup=markup, owner_id=uid))
-        
-    elif data.startswith("opp:"):
-        if is_private: return
-        _, game, stake, mode, target, who = data.split(":")
-        stake, target = int(stake), int(target)
-        if uid in busy: return
-        
-        try:
-            gid = await db_open_game(uid, game, mode, stake, opponent=0 if who == "bot" else -1)
-        except ValueError as e:
-            return await edit_msg(chat_id, msg.message_id, f"{pe('⚠️')} {str(e)}", owner_id=uid)
+@router.callback_query(F.data.startswith("tgt:"))
+async def cb_select_opponent(c: CallbackQuery):
+    await c.answer()
+    uid = c.from_user.id
+    if c.message.chat.type == "private" or msg_owner.get((c.message.chat.id, c.message.message_id)) != uid:
+        return
+    _, game, stake, mode, target = c.data.split(":")
+    base = f"{game}:{stake}:{mode}:{target}"
+    game_title = getattr(config, "GAME_NAMES", {}).get(game, game.title())
+    
+    txt = f"{game_pe(game)} <b>{game_title} · {usd(int(stake))}</b>\n<b>Player:</b> {mention(uid)}\n<b>Mode: {MODES[mode]['label']} ({target} points)</b>\n\n<b>Choose your opponent:</b>"
+    markup = kb([("Play vs Bot", f"opp:{base}:bot", "success", "🤖"), ("Play PvP", f"opp:{base}:pvp", "primary", "👤")], [("Back", f"mode:{game}:{stake}:{mode}", "danger", "❌")])
+    asyncio.create_task(edit_msg(c.message.chat.id, c.message.message_id, txt, markup=markup, owner_id=uid))
 
-        busy.add(uid)
-        user_match[uid] = gid
-        game_title = getattr(config, "GAME_NAMES", {}).get(game, game.title())
+@router.callback_query(F.data.startswith("opp:"))
+async def cb_open_match(c: CallbackQuery):
+    await c.answer()
+    uid = c.from_user.id
+    if c.message.chat.type == "private" or msg_owner.get((c.message.chat.id, c.message.message_id)) != uid or uid in busy:
+        return
+    
+    _, game, stake_str, mode, target_str, who = c.data.split(":")
+    stake, target = int(stake_str), int(target_str)
+    
+    try:
+        gid = await db_open_game(uid, game, mode, stake, opponent=0 if who == "bot" else -1)
+    except ValueError as e:
+        return await edit_msg(c.message.chat.id, c.message.message_id, f"{pe('⚠️')} {str(e)}", owner_id=uid)
 
-        if who == "bot":
-            m_obj = Match(game, mode, target, stake, (uid, 0))
-            sess = {"gid": gid, "type": "bot", "status": "playing", "chat_id": chat_id, "game": game, "mode": mode, "target": target, "stake": stake, "ua": uid, "ub": 0, "match": m_obj, "turn_uid": uid, "u_rolls": [], "b_rolls": [], "rolling": False, "round_num": 1, "last_action": time.time(), "lock": asyncio.Lock(), "prompt_msg_id": msg.message_id}
-            matches[gid] = sess
-            txt = f"{pe('🌊')} <b>The game has started</b>\n\n<b>Player 1:</b> {mention(uid)}\n<b>Player 2:</b> {pe('🤖')} <b>{html.escape(config.CASINO_NAME)}</b>\n<b>Bet: {usd(stake)}</b> {pe('🪙')}\n<b>Mode: {MODES[mode]['label']} — {target} points</b>\n\n<b>Roll the {game_title}</b> {game_pe(game)}"
-            asyncio.create_task(edit_msg(chat_id, msg.message_id, txt, markup=turn_kb(sess, show_bot_first=True), owner_id=uid))
-        else:
-            sess = {"gid": gid, "type": "pvp", "status": "waiting", "chat_id": chat_id, "game": game, "mode": mode, "target": target, "stake": stake, "ua": uid, "ub": 0, "u_rolls": [], "b_rolls": [], "rolling": False, "round_num": 1, "created_at": time.time(), "last_action": time.time(), "lock": asyncio.Lock(), "prompt_msg_id": msg.message_id}
-            matches[gid] = sess
-            txt = f"{pe('🎮')} <b>PvP Match Created</b>\n\n<b>Player 1:</b> {mention(uid)}\n<b>Game:</b> {game_pe(game)} <b>{game_title}</b>\n<b>Bet: {usd(stake)}</b> {pe('🪙')}\n<b>Mode: {MODES[mode]['label']} — {target} points</b>\n\n<i>Click «Accept game» to start PvP!</i>"
-            markup = kb([("Accept game", f"pvp_join:{gid}", "success", "✅")], [("Cancel game", f"cancel_pvp:{gid}", "danger", "❌")])
-            asyncio.create_task(edit_msg(chat_id, msg.message_id, txt, markup=markup, owner_id=uid))
+    busy.add(uid)
+    user_match[uid] = gid
+    game_title = getattr(config, "GAME_NAMES", {}).get(game, game.title())
 
-    elif data.startswith("pvp_join:"):
-        gid = data.split(":")[1]
-        sess = matches.get(gid)
-        if not sess or sess.get("status") != "waiting" or uid == sess["ua"] or uid in busy: return
+    if who == "bot":
+        m_obj = Match(game, mode, target, stake, (uid, 0))
+        sess = {"gid": gid, "type": "bot", "status": "playing", "chat_id": c.message.chat.id, "game": game, "mode": mode, "target": target, "stake": stake, "ua": uid, "ub": 0, "match": m_obj, "turn_uid": uid, "u_rolls": [], "b_rolls": [], "rolling": False, "round_num": 1, "last_action": time.time(), "lock": asyncio.Lock(), "prompt_msg_id": c.message.message_id}
+        matches[gid] = sess
+        txt = f"{pe('🌊')} <b>The game has started</b>\n\n<b>Player 1:</b> {mention(uid)}\n<b>Player 2:</b> {pe('🤖')} <b>{html.escape(config.CASINO_NAME)}</b>\n<b>Bet: {usd(stake)}</b> {pe('🪙')}\n<b>Mode: {MODES[mode]['label']} — {target} points</b>\n\n<b>Roll the {game_title}</b> {game_pe(game)}"
+        asyncio.create_task(edit_msg(c.message.chat.id, c.message.message_id, txt, markup=turn_kb(sess, show_bot_first=True), owner_id=uid))
+    else:
+        sess = {"gid": gid, "type": "pvp", "status": "waiting", "chat_id": c.message.chat.id, "game": game, "mode": mode, "target": target, "stake": stake, "ua": uid, "ub": 0, "u_rolls": [], "b_rolls": [], "rolling": False, "round_num": 1, "created_at": time.time(), "last_action": time.time(), "lock": asyncio.Lock(), "prompt_msg_id": c.message.message_id}
+        matches[gid] = sess
+        txt = f"{pe('🎮')} <b>PvP Match Created</b>\n\n<b>Player 1:</b> {mention(uid)}\n<b>Game:</b> {game_pe(game)} <b>{game_title}</b>\n<b>Bet: {usd(stake)}</b> {pe('🪙')}\n<b>Mode: {MODES[mode]['label']} — {target} points</b>\n\n<i>Click «Accept game» to start PvP!</i>"
+        markup = kb([("Accept game", f"pvp_join:{gid}", "success", "✅")], [("Cancel game", f"cancel_pvp:{gid}", "danger", "❌")])
+        asyncio.create_task(edit_msg(c.message.chat.id, c.message.message_id, txt, markup=markup, owner_id=uid))
 
-        try:
-            gid_b = await db_open_game(uid, sess["game"], sess["mode"], sess["stake"], opponent=-1)
-        except ValueError: return
+@router.callback_query(F.data.startswith("pvp_join:"))
+async def cb_join_pvp(c: CallbackQuery):
+    await c.answer()
+    uid = c.from_user.id
+    gid = c.data.split(":")[1]
+    sess = matches.get(gid)
+    if not sess or sess.get("status") != "waiting" or uid == sess["ua"] or uid in busy: return
 
-        sess["ub"] = uid
-        sess["gid_b"] = gid_b
-        sess["status"] = "playing"
-        sess["match"] = Match(sess["game"], sess["mode"], sess["target"], sess["stake"], (sess["ua"], uid))
-        sess["turn_uid"] = sess["ua"]
-        sess["last_action"] = time.time()
-        busy.add(uid)
-        user_match[uid] = gid
+    try:
+        gid_b = await db_open_game(uid, sess["game"], sess["mode"], sess["stake"], opponent=-1)
+    except ValueError: return
 
-        start_txt = f"{pe('🌊')} <b>The game has started</b>\n\n<b>Player 1:</b> {mention(sess['ua'])}\n<b>Player 2:</b> {mention(uid)}\n<b>Bet: {usd(sess['stake'])}</b> {pe('🪙')}\n<b>Mode: {MODES[sess['mode']]['label']} — {sess['target']} points</b>\n\n{mention(sess['ua'])}, <b>your turn!</b>"
-        asyncio.create_task(edit_msg(chat_id, msg.message_id, start_txt, markup=turn_kb(sess, show_bot_first=False), owner_id=sess["ua"]))
+    sess["ub"] = uid
+    sess["gid_b"] = gid_b
+    sess["status"] = "playing"
+    sess["match"] = Match(sess["game"], sess["mode"], sess["target"], sess["stake"], (sess["ua"], uid))
+    sess["turn_uid"] = sess["ua"]
+    sess["last_action"] = time.time()
+    busy.add(uid)
+    user_match[uid] = gid
 
-    elif data.startswith("cancel_pvp:"):
-        gid = data.split(":")[1]
-        sess = matches.get(gid)
-        if not sess or sess.get("status") != "waiting" or sess["ua"] != uid: return
-        
-        matches.pop(gid, None); user_match.pop(uid, None); busy.discard(uid)
-        asyncio.create_task(db_void_game(gid))
-        asyncio.create_task(edit_msg(chat_id, msg.message_id, f"{pe('⭕️')} <b>PvP match cancelled by</b> {mention(uid)} — <b>stake refunded.</b>", owner_id=uid))
+    start_txt = f"{pe('🌊')} <b>The game has started</b>\n\n<b>Player 1:</b> {mention(sess['ua'])}\n<b>Player 2:</b> {mention(uid)}\n<b>Bet: {usd(sess['stake'])}</b> {pe('🪙')}\n<b>Mode: {MODES[sess['mode']]['label']} — {sess['target']} points</b>\n\n{mention(sess['ua'])}, <b>your turn!</b>"
+    asyncio.create_task(edit_msg(c.message.chat.id, c.message.message_id, start_txt, markup=turn_kb(sess, show_bot_first=False), owner_id=sess["ua"]))
 
-    elif data.startswith("roll:"):
-        _, gid_str, order = data.split(":")
-        sess = matches.get(gid_str)
-        if not sess or sess.get("status") != "playing" or sess.get("turn_uid") != uid: return
-        
-        needed = sess["match"].rolls_needed
-        my_rolls = sess["u_rolls"] if uid == sess["ua"] else sess["b_rolls"]
-        if sess.get("rolling") or sess["lock"].locked() or len(my_rolls) >= needed: return
-        
-        asyncio.create_task(handle_roll_button(sess, uid, order))
+@router.callback_query(F.data.startswith("cancel_pvp:"))
+async def cb_cancel_pvp(c: CallbackQuery):
+    await c.answer()
+    uid = c.from_user.id
+    gid = c.data.split(":")[1]
+    sess = matches.get(gid)
+    if not sess or sess.get("status") != "waiting" or sess["ua"] != uid: return
+    
+    matches.pop(gid, None); user_match.pop(uid, None); busy.discard(uid)
+    asyncio.create_task(db_void_game(gid))
+    asyncio.create_task(edit_msg(c.message.chat.id, c.message.message_id, f"{pe('⭕️')} <b>PvP match cancelled by</b> {mention(uid)} — <b>stake refunded.</b>", owner_id=uid))
 
-    elif data.startswith("cashout:"):
-        gid = data.split(":")[1]
-        sess = matches.get(gid)
-        if not sess or sess["ua"] != uid or sess.get("rolling") or sess["lock"].locked(): return
-        cashout_amt = calc_cashout(sess["stake"], sess["match"].score[0], sess["match"].score[1], sess["target"])
-        if cashout_amt <= 0: return
-        asyncio.create_task(clear_buttons(chat_id, msg.message_id))
-        await finish_match(sess, cashout_amt, cashed_out=True)
+@router.callback_query(F.data.startswith("roll:"))
+async def cb_roll_button(c: CallbackQuery):
+    await c.answer()
+    uid = c.from_user.id
+    _, gid_str, order = c.data.split(":")
+    sess = matches.get(gid_str)
+    if not sess or sess.get("status") != "playing" or sess.get("turn_uid") != uid: return
+    
+    needed = sess["match"].rolls_needed
+    my_rolls = sess["u_rolls"] if uid == sess["ua"] else sess["b_rolls"]
+    if sess.get("rolling") or sess["lock"].locked() or len(my_rolls) >= needed: return
+    
+    asyncio.create_task(handle_roll_button(sess, uid, order))
+
+@router.callback_query(F.data.startswith("cashout:"))
+async def cb_cashout(c: CallbackQuery):
+    await c.answer()
+    uid = c.from_user.id
+    gid = c.data.split(":")[1]
+    sess = matches.get(gid)
+    if not sess or sess["ua"] != uid or sess.get("rolling") or sess["lock"].locked(): return
+    cashout_amt = calc_cashout(sess["stake"], sess["match"].score[0], sess["match"].score[1], sess["target"])
+    if cashout_amt <= 0: return
+    asyncio.create_task(clear_buttons(c.message.chat.id, c.message.message_id))
+    await finish_match(sess, cashout_amt, cashed_out=True)
 
 
 # --- SWEEPER TASK ---
